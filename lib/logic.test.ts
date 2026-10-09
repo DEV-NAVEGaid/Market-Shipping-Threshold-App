@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { appProxyCanonical, proxySignature, verifyProxySignature } from "./verify.ts";
-import { buildThresholdMap, pickLowestThreshold } from "./shipping.ts";
+import { buildThresholdMap, freeRateMinimum, pickLowestThreshold, type MethodDefinition } from "./shipping.ts";
 
 // Canonical-string vectors copied verbatim from Shopify's official appProxy tests
 // (shopify-app-js, hmac-validator.test.ts). Independent of our own hashing.
@@ -41,45 +41,74 @@ test("verify accepts a valid signature, rejects tampering", () => {
   assert.equal(verifyProxySignature(new URLSearchParams("shop=x"), secret), false);
 });
 
-test("pickLowestThreshold picks lowest non-null and converts to subunits", () => {
+const eur = (amount: string) => ({ amount, currencyCode: "EUR" });
+const priceMin = (amount: string, currencyCode = "EUR") => ({
+  field: "TOTAL_PRICE",
+  operator: "GREATER_THAN_OR_EQUAL_TO",
+  conditionCriteria: { amount, currencyCode },
+});
+
+test("freeRateMinimum only accepts free rates gated by a minimum order price", () => {
+  const m = (price: string, conds: MethodDefinition["methodConditions"], active = true): MethodDefinition => ({
+    active,
+    rateProvider: { price: eur(price) },
+    methodConditions: conds,
+  });
+  assert.deepEqual(freeRateMinimum(m("0.0", [priceMin("50.0")])), { threshold: 5000, currency: "EUR" });
+  assert.equal(freeRateMinimum(m("0.0", [])), null); // unconditional free rate
+  assert.equal(freeRateMinimum(m("13.99", [priceMin("50.0")])), null); // not free
+  assert.equal(freeRateMinimum(m("0.0", [priceMin("0.0")])), null); // >= 0 is no threshold
+  assert.equal(freeRateMinimum(m("0.0", [priceMin("50.0")], false)), null); // inactive
+  assert.equal(
+    freeRateMinimum(m("0.0", [{ field: "TOTAL_WEIGHT", operator: "GREATER_THAN_OR_EQUAL_TO", conditionCriteria: null }])),
+    null,
+  );
+  // Zero-decimal currencies come back 2-decimal-normalized: 4,200,000 IDR -> "4200000.0"
+  assert.deepEqual(freeRateMinimum(m("0.0", [priceMin("4200000.0", "IDR")])), { threshold: 420000000, currency: "IDR" });
+});
+
+test("pickLowestThreshold picks the lowest non-null", () => {
   assert.deepEqual(
-    pickLowestThreshold([
-      { freeDeliveryMinimumValue: { amount: "60.00", currencyCode: "SGD" } },
-      { freeDeliveryMinimumValue: null },
-      { freeDeliveryMinimumValue: { amount: "80.00", currencyCode: "SGD" } },
-    ]),
+    pickLowestThreshold([{ threshold: 8000, currency: "SGD" }, null, { threshold: 6000, currency: "SGD" }]),
     { threshold: 6000, currency: "SGD" },
   );
-  // Shopify stores IDR (zero-decimal) 2-decimal-normalized: 4,200,000 -> "4200000.00"
-  assert.deepEqual(
-    pickLowestThreshold([{ freeDeliveryMinimumValue: { amount: "4200000.00", currencyCode: "IDR" } }]),
-    { threshold: 420000000, currency: "IDR" },
-  );
-  assert.equal(pickLowestThreshold([{ freeDeliveryMinimumValue: null }]), null);
+  assert.equal(pickLowestThreshold([null]), null);
   assert.equal(pickLowestThreshold([]), null);
 });
 
-test("buildThresholdMap resolves by handle and by country code", () => {
-  const map = buildThresholdMap([
+test("buildThresholdMap matches navegaid's real data shape", () => {
+  const zone = (codes: string[], methods: MethodDefinition[]) => ({
+    zone: { countries: codes.map((countryCode) => ({ code: { countryCode } })) },
+    methodDefinitions: { nodes: methods },
+  });
+  const profiles = [
     {
-      handle: "germany",
-      conditions: { regionsCondition: { regions: { nodes: [{ code: "DE" }] } } },
-      delivery: {
-        shipping: {
-          optionDefinitions: {
+      profileLocationGroups: [
+        {
+          locationGroupZones: {
             nodes: [
-              { freeDeliveryMinimumValue: { amount: "50.00", currencyCode: "EUR" } },
-              { freeDeliveryMinimumValue: null },
+              zone(["DE"], [
+                { active: true, rateProvider: { price: eur("0.0") }, methodConditions: [priceMin("50.0")] },
+                { active: true, rateProvider: { price: eur("0.0") }, methodConditions: [] },
+              ]),
+              zone(["CA", "US"], [
+                { active: true, rateProvider: { price: eur("19.99") }, methodConditions: [priceMin("0.0")] },
+              ]),
             ],
           },
         },
-      },
+      ],
     },
-    { handle: "no-conditions", conditions: null, delivery: null },
-  ]);
-  const de = { threshold: 5000, currency: "EUR" };
-  assert.deepEqual(map.get("germany"), de);
-  assert.deepEqual(map.get("de"), de);
+  ];
+  const markets = [
+    { handle: "de", conditions: { regionsCondition: { regions: { nodes: [{ code: "DE" }] } } } },
+    { handle: "united-states", conditions: { regionsCondition: { regions: { nodes: [{ code: "US" }] } } } },
+    { handle: "no-conditions", conditions: null },
+  ];
+  const map = buildThresholdMap(markets, profiles);
+  assert.deepEqual(map.get("de"), { threshold: 5000, currency: "EUR" });
+  assert.equal(map.get("united-states"), null);
+  assert.equal(map.get("us"), null);
   assert.equal(map.get("no-conditions"), null);
   assert.equal(map.has("fr"), false);
 });

@@ -3,25 +3,40 @@ const API_VERSION = process.env.SHOPIFY_API_VERSION ?? "2026-10";
 export type Threshold = { threshold: number; currency: string };
 
 type MoneyV2 = { amount: string; currencyCode: string };
-type OptionDef = { freeDeliveryMinimumValue: MoneyV2 | null };
 
-const MARKETS_QUERY = `
-  query Markets {
+// Markets give us handle -> countries. The free-shipping threshold itself lives on the
+// delivery profiles: a rate priced 0 with a "TOTAL_PRICE >= X" condition.
+// (Market.delivery.shipping is null on this store, so it can't be used as the source.)
+const THRESHOLD_QUERY = `
+  query Thresholds {
     markets(first: 50) {
       nodes {
         handle
         conditions {
           regionsCondition {
-            regions(first: 250) {
+            regions(first: 50) {
               nodes { ... on MarketRegionCountry { code } }
             }
           }
         }
-        delivery {
-          shipping {
-            optionDefinitions(first: 50, active: true) {
-              nodes {
-                freeDeliveryMinimumValue { amount currencyCode }
+      }
+    }
+    deliveryProfiles(first: 10) {
+      nodes {
+        profileLocationGroups {
+          locationGroupZones(first: 20) {
+            nodes {
+              zone { countries { code { countryCode } } }
+              methodDefinitions(first: 20) {
+                nodes {
+                  active
+                  rateProvider { ... on DeliveryRateDefinition { price { amount currencyCode } } }
+                  methodConditions {
+                    field
+                    operator
+                    conditionCriteria { ... on MoneyV2 { amount currencyCode } }
+                  }
+                }
               }
             }
           }
@@ -36,23 +51,93 @@ export type MarketNode = {
   conditions?: {
     regionsCondition: { regions: { nodes: { code?: string }[] } } | null;
   } | null;
-  delivery: {
-    shipping: { optionDefinitions: { nodes: OptionDef[] } } | null;
-  } | null;
 };
 
-type MarketsData = { markets: { nodes: MarketNode[] } };
+export type MethodDefinition = {
+  active: boolean;
+  rateProvider: { price?: MoneyV2 } | null;
+  methodConditions: {
+    field: string;
+    operator: string;
+    conditionCriteria: Partial<MoneyV2> | null;
+  }[];
+};
 
-// Lookup keys are lowercase. Market handles win over country codes when they collide.
-export function buildThresholdMap(markets: MarketNode[]): Map<string, Threshold | null> {
+export type ZoneNode = {
+  zone: { countries: { code: { countryCode: string | null } }[] };
+  methodDefinitions: { nodes: MethodDefinition[] };
+};
+
+export type DeliveryProfileNode = {
+  profileLocationGroups: { locationGroupZones: { nodes: ZoneNode[] } }[];
+};
+
+type ThresholdData = {
+  markets: { nodes: MarketNode[] };
+  deliveryProfiles: { nodes: DeliveryProfileNode[] };
+};
+
+// Minimum order value (in subunits) that unlocks a free rate, or null if the rate
+// isn't a "free above X" rate. Only pure price conditions count; weight-based or
+// unconditional free rates are ignored.
+export function freeRateMinimum(method: MethodDefinition): Threshold | null {
+  const price = method.rateProvider?.price;
+  if (!method.active || !price || Number(price.amount) !== 0) return null;
+  if (method.methodConditions.length === 0) return null;
+
+  let min: Threshold | null = null;
+  for (const c of method.methodConditions) {
+    if (c.field !== "TOTAL_PRICE") return null;
+    if (c.operator !== "GREATER_THAN_OR_EQUAL_TO") continue;
+    const amount = Number(c.conditionCriteria?.amount);
+    if (!(amount > 0) || !c.conditionCriteria?.currencyCode) continue;
+    // Shopify returns 2-decimal-normalized amounts even for zero-decimal currencies.
+    min = { threshold: Math.round(amount * 100), currency: c.conditionCriteria.currencyCode };
+  }
+  return min;
+}
+
+export function pickLowestThreshold(candidates: (Threshold | null)[]): Threshold | null {
+  let best: Threshold | null = null;
+  for (const t of candidates) {
+    if (t && (best === null || t.threshold < best.threshold)) best = t;
+  }
+  return best;
+}
+
+// Lowest "free above X" threshold per country (uppercase ISO code), across all profiles.
+export function thresholdsByCountry(profiles: DeliveryProfileNode[]): Map<string, Threshold | null> {
+  const result = new Map<string, Threshold | null>();
+  for (const profile of profiles) {
+    for (const group of profile.profileLocationGroups) {
+      for (const zone of group.locationGroupZones.nodes) {
+        const zoneMin = pickLowestThreshold(zone.methodDefinitions.nodes.map(freeRateMinimum));
+        for (const country of zone.zone.countries) {
+          const code = country.code.countryCode;
+          if (!code) continue;
+          result.set(code, pickLowestThreshold([result.get(code) ?? null, zoneMin]));
+        }
+      }
+    }
+  }
+  return result;
+}
+
+// Lookup keys are lowercase: market handle ("de", "united-states") or country code ("us").
+// Market handles win over country codes when they collide.
+export function buildThresholdMap(
+  markets: MarketNode[],
+  profiles: DeliveryProfileNode[],
+): Map<string, Threshold | null> {
+  const perCountry = thresholdsByCountry(profiles);
   const byHandle = new Map<string, Threshold | null>();
   const byCountry = new Map<string, Threshold | null>();
+  for (const [code, t] of perCountry) byCountry.set(code.toLowerCase(), t);
   for (const market of markets) {
-    const threshold = pickLowestThreshold(market.delivery?.shipping?.optionDefinitions?.nodes ?? []);
-    byHandle.set(market.handle.toLowerCase(), threshold);
-    for (const region of market.conditions?.regionsCondition?.regions.nodes ?? []) {
-      if (region.code) byCountry.set(region.code.toLowerCase(), threshold);
-    }
+    const codes = (market.conditions?.regionsCondition?.regions.nodes ?? [])
+      .map((r) => r.code)
+      .filter((c): c is string => Boolean(c));
+    byHandle.set(market.handle.toLowerCase(), pickLowestThreshold(codes.map((c) => perCountry.get(c) ?? null)));
   }
   return new Map([...byCountry, ...byHandle]);
 }
@@ -118,19 +203,6 @@ async function adminGraphql<T>(query: string): Promise<T> {
   return json.data as T;
 }
 
-export function pickLowestThreshold(options: OptionDef[]): Threshold | null {
-  let best: Threshold | null = null;
-  for (const option of options) {
-    const value = option.freeDeliveryMinimumValue;
-    if (!value) continue;
-    const threshold = Math.round(Number(value.amount) * 100);
-    if (best === null || threshold < best.threshold) {
-      best = { threshold, currency: value.currencyCode };
-    }
-  }
-  return best;
-}
-
 // ponytail: module cache, best-effort on serverless (per warm instance). Add Redis only if Admin API rate limits bite.
 let cache: { at: number; map: Map<string, Threshold | null> } = { at: 0, map: new Map() };
 const TTL_MS = 5 * 60 * 1000;
@@ -139,7 +211,7 @@ const TTL_MS = 5 * 60 * 1000;
 export async function getThresholdForMarket(market: string): Promise<Threshold | null> {
   const key = market.trim().toLowerCase();
   if (Date.now() - cache.at < TTL_MS) return cache.map.get(key) ?? null;
-  const data = await adminGraphql<MarketsData>(MARKETS_QUERY);
-  cache = { at: Date.now(), map: buildThresholdMap(data.markets.nodes) };
+  const data = await adminGraphql<ThresholdData>(THRESHOLD_QUERY);
+  cache = { at: Date.now(), map: buildThresholdMap(data.markets.nodes, data.deliveryProfiles.nodes) };
   return cache.map.get(key) ?? null;
 }
