@@ -10,9 +10,17 @@ api_version = "2026-10"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_app_proxy,read_discounts,read_markets,read_shipping"
+scopes = "read_markets,write_app_proxy,read_shipping,read_discounts,read_metaobjects,write_metaobjects,read_metaobject_definitions,write_metaobject_definitions"
 optional_scopes = [ ]
 use_legacy_install_flow = false
 
 [auth]
-redirect_urls = "https://market-shipping-threshold-app.vercel.app/api/auth/callback"
+redirect_urls = [
+  "https://market-shipping-threshold-app.vercel.app/api/auth/callback",
+  "http://localhost:3000/api/auth/callback"
+]
+
+[app_proxy]
+url = "/api/proxy"
+prefix = "apps"
+subpath = "shipping-threshold"  
