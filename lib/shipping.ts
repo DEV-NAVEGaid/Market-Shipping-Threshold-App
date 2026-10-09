@@ -10,6 +10,13 @@ const MARKETS_QUERY = `
     markets(first: 50) {
       nodes {
         handle
+        conditions {
+          regionsCondition {
+            regions(first: 250) {
+              nodes { ... on MarketRegionCountry { code } }
+            }
+          }
+        }
         delivery {
           shipping {
             optionDefinitions(first: 50, active: true) {
@@ -24,16 +31,31 @@ const MARKETS_QUERY = `
   }
 `;
 
-type MarketsData = {
-  markets: {
-    nodes: {
-      handle: string;
-      delivery: {
-        shipping: { optionDefinitions: { nodes: OptionDef[] } } | null;
-      } | null;
-    }[];
-  };
+export type MarketNode = {
+  handle: string;
+  conditions?: {
+    regionsCondition: { regions: { nodes: { code?: string }[] } } | null;
+  } | null;
+  delivery: {
+    shipping: { optionDefinitions: { nodes: OptionDef[] } } | null;
+  } | null;
 };
+
+type MarketsData = { markets: { nodes: MarketNode[] } };
+
+// Lookup keys are lowercase. Market handles win over country codes when they collide.
+export function buildThresholdMap(markets: MarketNode[]): Map<string, Threshold | null> {
+  const byHandle = new Map<string, Threshold | null>();
+  const byCountry = new Map<string, Threshold | null>();
+  for (const market of markets) {
+    const threshold = pickLowestThreshold(market.delivery?.shipping?.optionDefinitions?.nodes ?? []);
+    byHandle.set(market.handle.toLowerCase(), threshold);
+    for (const region of market.conditions?.regionsCondition?.regions.nodes ?? []) {
+      if (region.code) byCountry.set(region.code.toLowerCase(), threshold);
+    }
+  }
+  return new Map([...byCountry, ...byHandle]);
+}
 
 function storeDomain(): string {
   // Accept "navegaid.myshopify.com" as well as "https://navegaid.myshopify.com/".
@@ -113,14 +135,11 @@ export function pickLowestThreshold(options: OptionDef[]): Threshold | null {
 let cache: { at: number; map: Map<string, Threshold | null> } = { at: 0, map: new Map() };
 const TTL_MS = 5 * 60 * 1000;
 
-export async function getThresholdForMarket(handle: string): Promise<Threshold | null> {
-  if (Date.now() - cache.at < TTL_MS) return cache.map.get(handle) ?? null;
+// `market` may be a market handle ("germany") or an ISO country code ("de").
+export async function getThresholdForMarket(market: string): Promise<Threshold | null> {
+  const key = market.trim().toLowerCase();
+  if (Date.now() - cache.at < TTL_MS) return cache.map.get(key) ?? null;
   const data = await adminGraphql<MarketsData>(MARKETS_QUERY);
-  const map = new Map<string, Threshold | null>();
-  for (const market of data.markets.nodes) {
-    const options = market.delivery?.shipping?.optionDefinitions?.nodes ?? [];
-    map.set(market.handle, pickLowestThreshold(options));
-  }
-  cache = { at: Date.now(), map };
-  return map.get(handle) ?? null;
+  cache = { at: Date.now(), map: buildThresholdMap(data.markets.nodes) };
+  return cache.map.get(key) ?? null;
 }

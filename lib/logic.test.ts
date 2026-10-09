@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { appProxyCanonical, proxySignature, verifyProxySignature } from "./verify.ts";
-import { pickLowestThreshold } from "./shipping.ts";
+import { buildThresholdMap, pickLowestThreshold } from "./shipping.ts";
 
 // Canonical-string vectors copied verbatim from Shopify's official appProxy tests
 // (shopify-app-js, hmac-validator.test.ts). Independent of our own hashing.
@@ -57,4 +57,29 @@ test("pickLowestThreshold picks lowest non-null and converts to subunits", () =>
   );
   assert.equal(pickLowestThreshold([{ freeDeliveryMinimumValue: null }]), null);
   assert.equal(pickLowestThreshold([]), null);
+});
+
+test("buildThresholdMap resolves by handle and by country code", () => {
+  const map = buildThresholdMap([
+    {
+      handle: "germany",
+      conditions: { regionsCondition: { regions: { nodes: [{ code: "DE" }] } } },
+      delivery: {
+        shipping: {
+          optionDefinitions: {
+            nodes: [
+              { freeDeliveryMinimumValue: { amount: "50.00", currencyCode: "EUR" } },
+              { freeDeliveryMinimumValue: null },
+            ],
+          },
+        },
+      },
+    },
+    { handle: "no-conditions", conditions: null, delivery: null },
+  ]);
+  const de = { threshold: 5000, currency: "EUR" };
+  assert.deepEqual(map.get("germany"), de);
+  assert.deepEqual(map.get("de"), de);
+  assert.equal(map.get("no-conditions"), null);
+  assert.equal(map.has("fr"), false);
 });
