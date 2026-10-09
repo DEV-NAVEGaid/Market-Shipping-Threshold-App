@@ -21,6 +21,6 @@ redirect_urls = [
 ]
 
 [app_proxy]
-url = "/api/proxy"
+url = "https://market-shipping-threshold-app.vercel.app/api/proxy"
 prefix = "apps"
 subpath = "shipping-threshold"  
