@@ -57,10 +57,24 @@ test("discount path", () => {
     remaining: 6000,
     currency: "EUR",
   });
+  // A profile that ships to the country but has no free rate still allows the discount.
+  assert.equal(run({ profiles: ["P1", "P3"], discount: eur(3000) }).threshold, 3000);
   // Higher discount minimum loses to the rates threshold.
   assert.deepEqual(run({ discount: eur(9000) }).threshold, 5000);
   // Tie -> same threshold either way.
   assert.deepEqual(run({ discount: eur(5000) }), { free: false, threshold: 5000, remaining: 4000, currency: "EUR" });
+});
+
+test("discount does not show the bar when the cart can't ship to the country", () => {
+  const d = eur(1500);
+  // No profile has a zone for ID.
+  assert.deepEqual(run({ country: "ID", discount: d }), HIDE);
+  // P2 has no zone for US, P1 does: mixed cart can't ship to US.
+  assert.deepEqual(run({ country: "US", profiles: ["P1", "P2"], discount: d }), HIDE);
+  // Unknown variant -> can't tell, hide.
+  assert.deepEqual(run({ profiles: ["P1", null], discount: d }), HIDE);
+  // P1 ships to US (zone without a free rate): discount applies.
+  assert.equal(run({ country: "US", discount: d }).threshold, 1500);
 });
 
 test("currency conversion: same, shop currency, other", () => {
@@ -77,8 +91,18 @@ test("currency conversion: same, shop currency, other", () => {
 });
 
 test("parseCartBody validates strictly", () => {
-  const ok = { currency: "EUR", rate: 1, total: 1000, variant_ids: [1, 2, 2] };
-  assert.deepEqual(parseCartBody(ok), { ok: true, value: { currency: "EUR", rate: 1, total: 1000, variantIds: [1, 2] } });
+  const flags = { product_discount: true, order_discount: false, discount_code: false };
+  const ok = { currency: "EUR", rate: 1, total: 1000, variant_ids: [1, 2, 2], ...flags };
+  assert.deepEqual(parseCartBody(ok), {
+    ok: true,
+    value: {
+      currency: "EUR",
+      rate: 1,
+      total: 1000,
+      variantIds: [1, 2],
+      discounts: { product: true, order: false, code: false },
+    },
+  });
   const bad: unknown[] = [
     null,
     "x",
@@ -95,7 +119,9 @@ test("parseCartBody validates strictly", () => {
     { ...ok, variant_ids: [1.5] },
     { ...ok, variant_ids: [0] },
     { ...ok, variant_ids: ["1"] },
-    { currency: "EUR", rate: 1, total: 1000 },
+    { currency: "EUR", rate: 1, total: 1000, ...flags },
+    { ...ok, discount_code: undefined },
+    { ...ok, product_discount: "false" },
     {},
   ];
   for (const body of bad) assert.equal(parseCartBody(body).ok, false, JSON.stringify(body));

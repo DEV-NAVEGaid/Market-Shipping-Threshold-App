@@ -5,6 +5,7 @@ import { appProxyCanonical, verifyProxySignature } from "./verify.ts";
 import {
   adminHttpError,
   buildThresholdMap,
+  discountCombines,
   discountForCountry,
   discountThresholds,
   freeRateMinimum,
@@ -203,6 +204,7 @@ test("discountThresholds counts only unrestricted automatic free-shipping discou
   const d = (over: Partial<DiscountFreeShipping>): DiscountFreeShipping => ({
     __typename: "DiscountAutomaticFreeShipping",
     status: "ACTIVE",
+    combinesWith: { productDiscounts: false, orderDiscounts: false, shippingDiscounts: false },
     appliesOnOneTimePurchase: true,
     maximumShippingPrice: null,
     minimumRequirement: null,
@@ -267,4 +269,23 @@ test("discountThresholds counts only unrestricted automatic free-shipping discou
   ]);
   assert.deepEqual(discountForCountry(lowest, "DE"), { threshold: 4000, currency: "EUR" });
   assert.deepEqual(discountForCountry(lowest, "FR"), { threshold: 7000, currency: "EUR" });
+});
+
+test("discountCombines follows both sides' combination settings, conservatively", () => {
+  const d = (productDiscounts: boolean, orderDiscounts: boolean) =>
+    ({ combinesWith: { productDiscounts, orderDiscounts, shippingDiscounts: false } }) as DiscountFreeShipping;
+  const cart = (product = false, order = false, code = false) => ({ product, order, code });
+
+  // No other discount on the cart -> always usable, even if another discount blocks shipping.
+  assert.equal(discountCombines(d(false, false), cart(), true), true);
+  // Product discount on the cart: this discount must allow product discounts...
+  assert.equal(discountCombines(d(true, false), cart(true), false), true);
+  assert.equal(discountCombines(d(false, true), cart(true), false), false);
+  // ...and no active automatic discount may refuse shipping combinations (e.g. navegaid "sale auto").
+  assert.equal(discountCombines(d(true, true), cart(true), true), false);
+  // Order discount on the cart.
+  assert.equal(discountCombines(d(false, true), cart(false, true), false), true);
+  assert.equal(discountCombines(d(true, false), cart(false, true), false), false);
+  // A discount code: its combination settings are unknown -> not usable.
+  assert.equal(discountCombines(d(true, true), cart(false, false, true), false), false);
 });

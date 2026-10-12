@@ -3,7 +3,9 @@ import type { Threshold } from "./shipping.ts";
 // Pure cart evaluation: which free-shipping threshold applies to this cart and how much is left.
 // All amounts are subunits (cents) in the cart's presentment currency.
 
-export type CartBody = { currency: string; rate: number; total: number; variantIds: number[] };
+// Discounts already applied to the cart (from /cart.js): automatic product/order discounts, any code.
+export type CartDiscounts = { product: boolean; order: boolean; code: boolean };
+export type CartBody = { currency: string; rate: number; total: number; variantIds: number[]; discounts: CartDiscounts };
 
 export type CartResult =
   | { free: boolean; threshold: number; remaining: number; currency: string }
@@ -14,7 +16,10 @@ export const MAX_VARIANTS = 250;
 
 export function parseCartBody(raw: unknown): { ok: true; value: CartBody } | { ok: false; error: string } {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return { ok: false, error: "body must be an object" };
-  const { currency, rate, total, variant_ids } = raw as Record<string, unknown>;
+  const { currency, rate, total, variant_ids, product_discount, order_discount, discount_code } = raw as Record<
+    string,
+    unknown
+  >;
   if (typeof currency !== "string" || !/^[A-Z]{3}$/.test(currency)) return { ok: false, error: "invalid currency" };
   if (typeof rate !== "number" || !Number.isFinite(rate) || rate <= 0) return { ok: false, error: "invalid rate" };
   if (typeof total !== "number" || !Number.isSafeInteger(total) || total < 0) return { ok: false, error: "invalid total" };
@@ -24,7 +29,19 @@ export function parseCartBody(raw: unknown): { ok: true; value: CartBody } | { o
   if (!variant_ids.every((id) => typeof id === "number" && Number.isSafeInteger(id) && id > 0)) {
     return { ok: false, error: "invalid variant id" };
   }
-  return { ok: true, value: { currency, rate, total, variantIds: [...new Set(variant_ids as number[])] } };
+  if (![product_discount, order_discount, discount_code].every((b) => typeof b === "boolean")) {
+    return { ok: false, error: "product_discount, order_discount and discount_code must be booleans" };
+  }
+  return {
+    ok: true,
+    value: {
+      currency,
+      rate,
+      total,
+      variantIds: [...new Set(variant_ids as number[])],
+      discounts: { product: product_discount as boolean, order: order_discount as boolean, code: discount_code as boolean },
+    },
+  };
 }
 
 // Threshold in cart currency, or null if it can't be converted safely.
@@ -51,18 +68,21 @@ export function evaluateCart(input: EvaluateInput): CartResult {
   const { country, total, currency, rate, shopCurrency } = input;
   const convert = (t: Threshold | null) => (t ? convertThreshold(t, currency, shopCurrency, rate) : null);
 
+  // Every item must ship to the country: its profile needs a zone for it (a country key in
+  // byProfile). Otherwise checkout can't ship there, so no path applies, discounts included.
+  const zones = [...new Set(input.profiles)].map((p) => (p ? input.byProfile.get(p) : undefined));
+  if (zones.length === 0 || zones.some((z) => !z?.has(country))) return HIDE;
+
   // Rates path: Shopify checks price conditions against the cart total and charges each
   // profile's rate, so the cart ships free once the highest profile threshold is reached.
   let rates: number | null = null;
-  if (input.profiles.length > 0) {
-    for (const profile of new Set(input.profiles)) {
-      const t = profile ? convert(input.byProfile.get(profile)?.get(country) ?? null) : null;
-      if (t === null) {
-        rates = null;
-        break;
-      }
-      rates = Math.max(rates ?? 0, t);
+  for (const z of zones) {
+    const t = convert(z!.get(country) ?? null);
+    if (t === null) {
+      rates = null;
+      break;
     }
+    rates = Math.max(rates ?? 0, t);
   }
   const discount = convert(input.discount);
 

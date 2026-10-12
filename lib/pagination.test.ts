@@ -59,22 +59,26 @@ const STORE = {
 const freeShipping = (status: string): DiscountFreeShipping => ({
   __typename: "DiscountAutomaticFreeShipping",
   status,
+  combinesWith: { productDiscounts: true, orderDiscounts: true, shippingDiscounts: false },
   appliesOnOneTimePurchase: true,
   maximumShippingPrice: null,
   minimumRequirement: null,
   destinationSelection: { __typename: "DiscountCountryAll", allCountries: true },
   context: { __typename: "DiscountBuyerSelectionAll" },
 });
-// Search filters should already exclude the last two; the fetch layer drops them anyway.
-const DISCOUNTS: DiscountFreeShipping[] = [
-  freeShipping("ACTIVE"),
-  freeShipping("SCHEDULED"),
-  { __typename: "DiscountAutomaticBasic" } as DiscountFreeShipping,
-];
+// Non-active free-shipping nodes are dropped; other discounts only feed blocksShipping
+// (a free-shipping discount's own shippingDiscounts flag doesn't count).
+const basic = (shippingDiscounts: boolean) =>
+  ({
+    __typename: "DiscountAutomaticBasic",
+    combinesWith: { productDiscounts: true, orderDiscounts: false, shippingDiscounts },
+  }) as DiscountFreeShipping;
+const DISCOUNTS: DiscountFreeShipping[] = [freeShipping("ACTIVE"), freeShipping("SCHEDULED"), basic(true), basic(false)];
 
 const EXPECTED: ThresholdData = {
   shopCurrency: "EUR",
   discounts: { nodes: [DISCOUNTS[0]] },
+  blocksShipping: true,
   markets: {
     nodes: [
       { id: "gid://shopify/Market/1", handle: "de", conditions: { regionsCondition: { regions: { nodes: [{ code: "DE" }] } } } },
@@ -247,8 +251,8 @@ test("first:1 everywhere walks every connection and assembles the same data", as
   ]) {
     assert.ok(calls.includes(op), `${op} was used`);
   }
-  // 3 market pages + 2 extra "eu" region pages; 2 profile pages + 2 zone pages + 2 rate pages; 3 discount pages.
-  assert.equal(calls.length, 14);
+  // 3 market pages + 2 extra "eu" region pages; 2 profile pages + 2 zone pages + 2 rate pages; 4 discount pages.
+  assert.equal(calls.length, 15);
   assert.equal(costs.length, calls.length);
   assert.deepEqual(data, EXPECTED);
 

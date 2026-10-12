@@ -162,17 +162,23 @@ const RATES_QUERY = `
   }
 `;
 
-// Shop currency + active automatic free-shipping discounts (other discount types are dropped).
+// Shop currency + every active automatic discount (Shopify allows at most 25): free-shipping ones
+// are evaluated, the others only tell us whether they refuse to combine with shipping discounts.
+const COMBINES_WITH = "combinesWith { productDiscounts orderDiscounts shippingDiscounts }";
 const DISCOUNTS_QUERY = `
   query ThresholdDiscounts($first: Int!, $after: String) {
     shop { currencyCode }
-    discountNodes(first: $first, after: $after, query: "method:automatic AND type:free_shipping AND status:active") {
+    discountNodes(first: $first, after: $after, query: "method:automatic AND status:active") {
       pageInfo { hasNextPage endCursor }
       nodes {
         discount {
           __typename
+          ... on DiscountAutomaticBasic { ${COMBINES_WITH} }
+          ... on DiscountAutomaticBxgy { ${COMBINES_WITH} }
+          ... on DiscountAutomaticApp { ${COMBINES_WITH} }
           ... on DiscountAutomaticFreeShipping {
             status
+            ${COMBINES_WITH}
             appliesOnOneTimePurchase
             maximumShippingPrice { amount currencyCode }
             minimumRequirement {
@@ -338,13 +344,18 @@ export async function fetchThresholdData(
   // --- Shop currency + automatic free-shipping discounts ---
   let shopCurrency = "";
   const discounts: DiscountFreeShipping[] = [];
+  let blocksShipping = false;
   let discountsAfter: string | null = null;
   do {
     const page: { shop: { currencyCode: string }; discountNodes: Connection<{ discount: DiscountFreeShipping }> } =
       await request(DISCOUNTS_QUERY, { first: sizes.discounts, after: discountsAfter });
     shopCurrency ||= page.shop.currencyCode;
     for (const { discount } of page.discountNodes.nodes) {
-      if (discount.__typename === "DiscountAutomaticFreeShipping" && discount.status === "ACTIVE") discounts.push(discount);
+      if (discount.__typename === "DiscountAutomaticFreeShipping") {
+        if (discount.status === "ACTIVE") discounts.push(discount);
+      } else if (discount.combinesWith?.shippingDiscounts === false) {
+        blocksShipping = true;
+      }
     }
     discountsAfter = nextCursor(page.discountNodes.pageInfo, "discountNodes");
   } while (discountsAfter);
@@ -355,6 +366,7 @@ export async function fetchThresholdData(
       deliveryProfiles: { nodes: profiles },
       shopCurrency,
       discounts: { nodes: discounts },
+      blocksShipping,
     },
     costs,
   };

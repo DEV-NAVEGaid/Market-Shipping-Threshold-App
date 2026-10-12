@@ -1,6 +1,6 @@
 import { normalizeShop, SCOPES } from "./oauth.ts";
 import { fetchThresholdData, type FetchOptions, type GraphqlFetcher } from "./pagination.ts";
-import { evaluateCart, type CartBody, type CartResult } from "./cart.ts";
+import { evaluateCart, type CartBody, type CartDiscounts, type CartResult } from "./cart.ts";
 
 const API_VERSION = process.env.SHOPIFY_API_VERSION ?? "2026-10";
 
@@ -40,10 +40,13 @@ export type DeliveryProfileNode = {
   profileLocationGroups: { locationGroupZones: { nodes: ZoneNode[] } }[];
 };
 
+export type CombinesWith = { productDiscounts: boolean; orderDiscounts: boolean; shippingDiscounts: boolean };
+
 // Active automatic free-shipping discount, raw Admin API union shapes (2026-10).
 export type DiscountFreeShipping = {
   __typename: string; // "DiscountAutomaticFreeShipping"; other discount types are dropped while fetching
   status: string;
+  combinesWith: CombinesWith;
   appliesOnOneTimePurchase: boolean;
   maximumShippingPrice: MoneyV2 | null;
   minimumRequirement: { __typename: string; greaterThanOrEqualToSubtotal?: MoneyV2 } | null;
@@ -57,6 +60,8 @@ export type ThresholdData = {
   deliveryProfiles: { nodes: DeliveryProfileNode[] };
   shopCurrency: string;
   discounts: { nodes: DiscountFreeShipping[] };
+  // Some other active automatic discount doesn't combine with shipping discounts.
+  blocksShipping: boolean;
 };
 
 // Minimum order value (in subunits) that unlocks a free rate, or null if the rate
@@ -176,6 +181,18 @@ export function discountThresholds(
     for (const code of codes) add(code.toUpperCase(), t);
   }
   return { all, byCountry };
+}
+
+// Whether a free-shipping discount can still apply next to the discounts already on the cart.
+// Shopify combines two discounts only if both allow it. We can't tell which code or automatic
+// discount is on the cart, so: any code -> no; an automatic discount -> only if no active
+// automatic discount refuses shipping combinations and this one accepts that discount class.
+export function discountCombines(d: DiscountFreeShipping, cart: CartDiscounts, blocksShipping: boolean): boolean {
+  if (cart.code) return false;
+  if ((cart.product || cart.order) && blocksShipping) return false;
+  if (cart.product && !d.combinesWith.productDiscounts) return false;
+  if (cart.order && !d.combinesWith.orderDiscounts) return false;
+  return true;
 }
 
 export function discountForCountry(d: DiscountThresholds, country: string): Threshold | null {
@@ -344,13 +361,19 @@ type ThresholdMaps = {
   byKey: Map<string, Threshold | null>;
   byCountry: Map<string, Threshold | null>;
   byProfile: Map<string, Map<string, Threshold | null>>;
-  discounts: DiscountThresholds;
+  markets: MarketNode[];
+  freeShipping: DiscountFreeShipping[];
+  blocksShipping: boolean;
   shopCurrency: string;
 };
 
 // ponytail: module cache, best-effort on serverless (per warm instance). Add Redis only if Admin API rate limits bite.
 let cache: { at: number; maps: ThresholdMaps | null } = { at: 0, maps: null };
 const TTL_MS = 5 * 60 * 1000;
+// When a refresh fails, keep serving the last good data for up to this long, retrying every minute.
+const STALE_MAX_MS = 24 * 60 * 60 * 1000;
+const STALE_RETRY_MS = 60 * 1000;
+let lastGoodAt = 0;
 
 // Single-flight: concurrent cold requests share one paginated walk instead of each
 // draining the Admin API throttle bucket.
@@ -365,11 +388,21 @@ async function thresholdMaps(): Promise<ThresholdMaps> {
         byKey: buildThresholdMap(data.markets.nodes, data.deliveryProfiles.nodes),
         byCountry: thresholdsByCountry(data.deliveryProfiles.nodes),
         byProfile: thresholdsByProfile(data.deliveryProfiles.nodes),
-        discounts: discountThresholds(data.discounts.nodes, data.markets.nodes, data.shopCurrency),
+        markets: data.markets.nodes,
+        freeShipping: data.discounts.nodes,
+        blocksShipping: data.blocksShipping,
         shopCurrency: data.shopCurrency,
       };
       cache = { at: Date.now(), maps };
+      lastGoodAt = cache.at;
       return maps;
+    } catch (error) {
+      // Transient Admin API trouble: serve the last good data instead of hiding the bar.
+      const stale = cache.maps;
+      if (!stale || Date.now() - lastGoodAt > STALE_MAX_MS) throw error;
+      console.error("thresholds: refresh failed, serving stale data", error instanceof Error ? error.message : error);
+      cache = { at: Date.now() - TTL_MS + STALE_RETRY_MS, maps: stale };
+      return stale;
     } finally {
       inflight = null;
     }
@@ -406,10 +439,17 @@ export async function resolveVariantProfiles(ids: number[]): Promise<(string | n
   });
   for (let i = 0; i < missing.length; i += VARIANT_CHUNK) {
     const chunk = missing.slice(i, i + VARIANT_CHUNK);
-    const { data } = await adminGraphql<{ nodes: ({ id?: string; deliveryProfile?: { id: string } | null } | null)[] }>(
-      VARIANT_PROFILES_QUERY,
-      { ids: chunk.map((id) => `gid://shopify/ProductVariant/${id}`) },
-    );
+    let data: { nodes: ({ id?: string; deliveryProfile?: { id: string } | null } | null)[] };
+    try {
+      ({ data } = await adminGraphql<typeof data>(VARIANT_PROFILES_QUERY, {
+        ids: chunk.map((id) => `gid://shopify/ProductVariant/${id}`),
+      }));
+    } catch (error) {
+      // Same as thresholds: keep using stale entries (up to STALE_MAX_MS) if every id has one.
+      if (chunk.some((id) => !variantCache.has(id) || now - variantCache.get(id)!.at > STALE_MAX_MS)) throw error;
+      console.error("variants: lookup failed, serving stale data", error instanceof Error ? error.message : error);
+      continue;
+    }
     const found = new Map<string, string | null>();
     for (const node of data.nodes) if (node?.id) found.set(node.id, node.deliveryProfile?.id ?? null);
     for (const id of chunk) {
@@ -423,6 +463,7 @@ export async function resolveVariantProfiles(ids: number[]): Promise<(string | n
 export async function evaluateCartForCountry(country: string, body: CartBody): Promise<CartResult> {
   const code = country.trim().toUpperCase();
   const [maps, profiles] = await Promise.all([thresholdMaps(), resolveVariantProfiles(body.variantIds)]);
+  const usable = maps.freeShipping.filter((d) => discountCombines(d, body.discounts, maps.blocksShipping));
   return evaluateCart({
     country: code,
     total: body.total,
@@ -431,6 +472,6 @@ export async function evaluateCartForCountry(country: string, body: CartBody): P
     shopCurrency: maps.shopCurrency,
     profiles,
     byProfile: maps.byProfile,
-    discount: discountForCountry(maps.discounts, code),
+    discount: discountForCountry(discountThresholds(usable, maps.markets, maps.shopCurrency), code),
   });
 }
