@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --test lib/logic.test.ts"
+    "test": "node --test lib/logic.test.ts lib/oauth.test.ts lib/pagination.test.ts lib/cart.test.ts"
   },
   "dependencies": {
     "next": "16.4.0",
